@@ -3,12 +3,28 @@
 
 #include <stddef.h>
 
-void heap_init();
+/*	Initializes the heap allocator
+ */
+void heap_init(void);
 
+/*	Allocates memory to the heap
+ *
+ *	Args:
+ *		size_t size:
+ *			size of the allocated memory in byts
+ *
+ *	Returns:
+ *		void *:
+ *			pointer to the allocated memory
+ */
 void *heap_alloc(size_t size);
 
+/*	Frees previously allocated memory
+ *	
+ *	Args:
+ *		void *ptr:
+ *			pointer to the allocated memory to be freed
+ */
 void heap_free(void *ptr);
 
-void *heap_realloc(void *ptr);
-
-#endif 
+#endif
