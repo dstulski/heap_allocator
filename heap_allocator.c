@@ -9,9 +9,9 @@
 #define SQUARE(x) (x * x)
 
 #define WORD_SIZE_BYTES 4
-#define NUM_SIZE_CLASSES 8
+#define NUM_SIZE_CLASSES 11
 #define WORDS_TO_BYTES(num_words) ((num_words) * WORD_SIZE_BYTES)
-#define BYTES_TO_WORDS(size) ((size + WORD_SIZE_BYTES - 1) / (SQUARE(WORD_SIZE_BYTES)))
+#define BYTES_TO_WORDS(size) (size / WORD_SIZE_BYTES + (size % WORD_SIZE_BYTES != 0))
 
 /* Doubly linked list node representing the head of a block */
 typedef struct BlockMetadata {
@@ -32,6 +32,8 @@ typedef struct BlockTail {
 #define TAIL_SIZE sizeof(BlockTail)
 #define TAIL_WORDS BYTES_TO_WORDS(TAIL_SIZE)
 
+#define BLOCK_SIZE_WORDS(block) METADATA_SIZE + block->num_words + TAIL_SIZE
+
 #define CAN_BLOCK_DATA_FIT(num_words) (num_words >= METADATA_WORDS + TAIL_WORDS)
 
 /* Linked list node in the segmented free list */
@@ -46,7 +48,8 @@ typedef struct SizeClass {
 SizeClass *size_classes[NUM_SIZE_CLASSES] = {NULL};
 
 #define MAX_WORDS size_classes[NUM_SIZE_CLASSES - 1]->max_words
-#define HEAP_BOTTOM (void *)(size_classes[NUM_SIZE_CLASSES - 1] + 1)
+#define HEAP_BOTTOM size_classes[NUM_SIZE_CLASSES - 1] + 1
+#define HEAP_TOP sbrk(0)
 
 /* STATIC FUNCTION PROTOTYPES */
 
@@ -167,6 +170,15 @@ static BlockMetadata *split(BlockMetadata *block, size_t words_alloced);
  */
 static BlockMetadata *coalesce(BlockMetadata *block);
 
+/*	Removes a block with given address from the free list
+ *
+ *	Args:
+ *		BlockMetadata *block:
+ *			address of the block to be removed
+ *
+ */
+static void free_list_remove(BlockMetadata *block);
+
 /* IMPLEMENTATION */
 
 static inline BlockMetadata *get_meta_from_tail(BlockTail *tail)
@@ -178,6 +190,9 @@ static inline BlockTail *get_tail_from_meta(BlockMetadata *meta)
 {
 	return (BlockTail *)((char *)meta + METADATA_SIZE + WORDS_TO_BYTES(meta->num_words));
 }
+
+#define NEXT_BLOCK(block) (BlockMetadata *)(get_tail_from_meta(block) + 1)
+#define PREV_BLOCK(block) get_meta_from_tail((BlockTail *)block - 1)
 
 static SizeClass *find_size_class(size_t num_words)
 {
@@ -195,39 +210,48 @@ static SizeClass *find_size_class(size_t num_words)
 	return class;
 }
 
-void heap_free(void *ptr)
-{
-	BlockMetadata *block = (BlockMetadata *)ptr - 1;
+void heap_free(void *ptr) {
+    if (ptr == NULL) {
+        return;
+    }
 
-	SizeClass *class = find_size_class(block->num_words);
-	block->is_free = 1;
+    BlockMetadata *block = (BlockMetadata *)ptr - 1;
 
-	BlockMetadata *curr = class->first_block;
-	if (curr == NULL) {
-		class->first_block = block;
-		block->next = NULL;
-		block->prev = NULL;
-		return;
-	}
+    if (block->is_free) {
+        fprintf(stderr, "Double free detected\n");
+        return;
+    }
 
-	/* iterate until a block with a larger address is found */
-	while (curr->next != NULL && curr < block) {
-		curr = curr->next;
-	}
+    SizeClass *class = find_size_class(block->num_words);
+    block->is_free = 1;
 
-	/* modify pointers accordingly */
-	if (curr > block) {
+    BlockMetadata *curr = class->first_block;
+
+    if (curr == NULL) {
+        class->first_block = block;
+        block->next = NULL;
+        block->prev = NULL;
+        return;
+    }
+
+	BlockMetadata *prev = curr->prev;
+    while (curr != NULL && curr < block) {
+		prev = curr;
+        curr = curr->next;
+    }
+
+	if (curr != NULL) {
 		block->next = curr;
 		block->prev = curr->prev;
-		curr->prev->next = block;
 		curr->prev = block;
+		if (curr->prev != NULL) {
+			curr->prev->next = block;
+		} else {
+			class->first_block = block;
+		}
 	} else {
-		/* if free block has the largest address in the size class,
-		 * we must be at the end of the list
-		 */
-		block->next = curr->next;
-		block->prev = curr;
-		curr->next = block;
+		prev->next = block;
+		block->prev = prev;
 	}
 }
 
@@ -275,8 +299,9 @@ static BlockMetadata *split_left(BlockMetadata *block, size_t words_alloced)
 		size_t free_words = extra_words - METADATA_WORDS - TAIL_WORDS;
 
 		BlockMetadata *free_block_metadata = (BlockMetadata *)(new_alloced_tail + 1);
-		BlockTail *free_block_tail = get_tail_from_meta(free_block_metadata);
 		free_block_metadata->num_words = free_words;
+
+		BlockTail *free_block_tail = get_tail_from_meta(free_block_metadata);
 		free_block_tail->num_words = free_words;
 
 		if (free_block_metadata->num_words != 0) {
@@ -307,7 +332,12 @@ static BlockMetadata *split_right(BlockMetadata *block, size_t words_alloced)
 		new_alloced_head->num_words = words_alloced;
 		new_alloced_head->is_free = 0;
 
-		heap_free(free_block_metadata + 1);
+		if (free_block_metadata->num_words != 0) {
+			heap_free(free_block_metadata + 1);
+		} else {
+			free_block_metadata->is_free = 1;
+		}
+		// coalesce(free_block_metadata);
 		return new_alloced_head;
 	}
 	return block;
@@ -316,23 +346,21 @@ static BlockMetadata *split_right(BlockMetadata *block, size_t words_alloced)
 static BlockMetadata *split(BlockMetadata *block, size_t words_alloced)
 {
 
-	int is_heap_bottom = block == HEAP_BOTTOM;
-	if (is_heap_bottom) {
+	if (block == HEAP_BOTTOM) {
 		return split_left(block, words_alloced);
 	}
 
-	BlockMetadata *next_block = (BlockMetadata *)(get_tail_from_meta(block) + 1);
+	BlockMetadata *next_block = NEXT_BLOCK(block);
 
-	int is_heap_top = next_block == sbrk(0);
-	if (is_heap_top) {
+	if (next_block == HEAP_TOP) {
 		return split_right(block, words_alloced);
 	}
 
-	BlockMetadata *prev_block = get_meta_from_tail((BlockTail *)block - 1);
+	BlockMetadata *prev_block = PREV_BLOCK(block);
 
-	int left_is_larger_than_right = next_block->is_free == 0 ||
-		(prev_block->is_free == 1 &&
-		 next_block->is_free == 1 &&
+	int left_is_larger_than_right = !next_block->is_free ||
+		(prev_block->is_free &&
+		 next_block->is_free &&
 		 prev_block->num_words >= next_block->num_words);
 
 	/* we want the free block in the left part of the split if there is a free block
@@ -348,8 +376,67 @@ static BlockMetadata *split(BlockMetadata *block, size_t words_alloced)
 	return split_left(block, words_alloced);
 }
 
+static void free_list_remove(BlockMetadata *block)
+{
+	if (block->prev != NULL) {
+		block->prev->next = block->next;
+	} else {
+		SizeClass *class = find_size_class(block->num_words);
+		class->first_block = block->next;
+	}
+	if (block->next != NULL) {
+		block->next->prev = block->prev;
+	}
+}
+
 static BlockMetadata *coalesce(BlockMetadata *block)
 {
+	BlockMetadata *meta = block;
+	BlockMetadata *next_block = NULL;
+	BlockMetadata *prev_block = NULL;
+
+	if (block != HEAP_BOTTOM) {
+		prev_block = PREV_BLOCK(meta);
+		if (prev_block->is_free) {
+			BlockTail *tail = get_tail_from_meta(meta);
+			meta = prev_block;
+
+			size_t prev_block_num_words = BLOCK_SIZE_WORDS(prev_block);
+
+			meta->num_words += prev_block_num_words;
+			tail->num_words += prev_block_num_words;
+		} else {
+			prev_block = NULL;
+		}
+	}
+
+	if (next_block != HEAP_TOP) {
+		BlockMetadata *next_block = NEXT_BLOCK(meta);
+		if (next_block->is_free) {
+			BlockTail *tail = get_tail_from_meta(next_block);
+
+			size_t block_num_words = BLOCK_SIZE_WORDS(meta);
+			size_t next_block_num_words = BLOCK_SIZE_WORDS(next_block);
+
+			meta->num_words += next_block_num_words;
+			tail->num_words += block_num_words;
+		} else {
+			next_block = NULL;
+		}
+	}
+
+	if (prev_block != NULL || next_block != NULL) {
+		free_list_remove(block);
+		if (prev_block != NULL) {
+			free_list_remove(prev_block);
+		}
+		if (next_block != NULL) {
+			free_list_remove(next_block);
+		}
+	}
+
+	heap_free(meta + 1);
+	return meta;
 }
 
 void heap_init(void)
@@ -367,7 +454,7 @@ void heap_init(void)
 		exit(1);
 	}
 
-	size_t size_buckets[NUM_SIZE_CLASSES] = {2, 3, 4, 8, 16, 32, 64, 128};
+	size_t size_buckets[NUM_SIZE_CLASSES] = {2, 3, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
 
 	for (size_t i = 0; i < NUM_SIZE_CLASSES; i++) {
 		size_classes[i] = &class[i];
@@ -378,4 +465,39 @@ void heap_init(void)
 
 void *heap_alloc(size_t size)
 {
+	if (size == 0) {
+		return NULL;
+	}
+
+	size_t num_words = BYTES_TO_WORDS(size);
+	if (num_words > MAX_WORDS) {
+		fprintf(stderr, "Allocation too large!");
+		exit(1);
+	}
+
+	BlockMetadata *candidate_block = find_free_block(num_words);
+	if (candidate_block == NULL) {
+		return request_new_block(num_words) + 1;
+	}
+
+	assert(candidate_block->is_free == 1);
+	free_list_remove(candidate_block);
+	candidate_block->is_free = 0;
+	return split(candidate_block, num_words) + 1;
+}
+
+void print_heap(void)
+{
+	for (size_t i = 0; i < NUM_SIZE_CLASSES; i++) {
+		BlockMetadata *curr = size_classes[i]->first_block;
+		printf("Size Class [%ld]", size_classes[i]->max_words);
+		if (curr != NULL) {
+			while (curr != NULL) {
+				printf("| Words: %ld, Bytes: %ld, Address %p, Free %d | ", curr->num_words, WORDS_TO_BYTES(curr->num_words), curr, curr->is_free);
+				curr = curr->next;
+			}
+		}
+		printf("\n");
+	}
+	printf("-------------------------------------\n");
 }
